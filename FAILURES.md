@@ -1,321 +1,217 @@
 # FAILURES.md
 
-Every way this system can still lose a DM, send one twice, or report a wrong
-number. Each entry says what triggers it and whether I **observed** it or am
-**reasoning** about it, because those are not the same claim and the difference
-should be visible without taking my word for it.
+Everything I know is still wrong with this, and how I know.
 
-Numbers quoted as observed come from `tools/loadtest.py`, which fires a
-generated event stream at the real app and grades it against a truth computed
-by a separate implementation, plus `tools/fake_pseudogram.py`, which audits my
-client from the server side.
+I've marked each one **[saw it]** or **[haven't seen it]**. The first means it
+actually happened during a run and I have the numbers. The second means I read
+the code and think it can happen, but I haven't triggered it. Those are
+different claims and I didn't want to blur them.
 
----
-
-## 1. Losing a DM
-
-### 1.1 SQLite in production loses everything on restart — OBSERVED (by design of the free tier)
-
-`DATABASE_URL` defaults to SQLite so tests need no setup. A free Render web
-service has no persistent disk, so if that default reaches production the
-database lives in the container filesystem and is destroyed on every redeploy,
-crash and wake-from-idle. That takes the outbox, the rate-limit window and all
-four counters with it — `/stats` would report zeros for work that genuinely
-happened.
-
-Mitigated by pointing `DATABASE_URL` at managed Postgres, which is what the
-deployment does. It is listed first because it is a configuration away from
-being the worst failure in the file, and nothing in the code enforces it.
-
-### 1.2 App and database in different regions breaks the contract — OBSERVED
-
-Every webhook does one database round trip before it answers, so webhook latency
-is bounded below by the app→database RTT. Measured, same code, same 560-delivery
-stream:
-
-| Database | p50 | p95 | max | throughput |
-|---|---|---|---|---|
-| SQLite, local disk | 53ms | 174ms | 824ms | 56/s |
-| Neon `us-west-2`, driven from India | **4284ms** | **5176ms** | 6598ms | 8.8/s |
-
-The p95 is past the 5-second contract. All 560 still returned 200 and every
-counter was correct — this degrades latency, not correctness — but a webhook
-that times out never enters the inbox and is invisible to every counter
-afterwards.
-
-Production has both in Oregon, where the RTT is 1-3ms. `/health` reports
-`database.round_trip_ms` specifically so this is checkable in one request rather
-than discovered under load.
-
-**Worse, the same run livelocked.** Ingest processes a batch in a single
-transaction and each event costs ~4 round trips, so a 200-event batch held ~800
-round trips open. On the high-latency link the connection dropped before the
-transaction could commit, the batch rolled back, retried, and dropped again —
-backlog frozen at 519 across 44 seconds with zero progress. Batch size is now 50,
-which bounds the transaction enough that latency costs throughput instead of all
-forward progress. The underlying shape — one long transaction per batch — is
-unchanged, so a slow enough link still stalls it.
-
-### 1.3 A free instance asleep is an instance not sending — REASONED
-
-Render free tiers sleep after ~15 minutes idle. While asleep no worker runs, so
-a queue of pending DMs makes no progress, and the first webhook after wake takes
-~50s — well past the 5-second contract. An external pinger on `/health` every 10
-minutes is required, and is not part of this repo. If the pinger dies, the
-service silently stops delivering.
-
-### 1.3 A quarantined event's DMs are dropped — OBSERVED (mechanism, not an occurrence)
-
-Ingest processes deliveries in batches inside one transaction. If an event
-raises, the batch rolls back, the loop retries it, and it raises again — one bad
-row stalls the entire inbox forever, silently. That is the worst outcome in the
-system, so after two consecutive batch failures the loop switches to one
-transaction per delivery (`process_pending_isolated`) and any delivery that
-still raises is marked processed and counted in `events_error`.
-
-The tradeoff is explicit: **the DMs for that event are lost** rather than
-blocking every event behind it. `events_error` is non-zero exactly when this has
-happened, and it is surfaced at `/stats/detail` under
-`rejections.quarantined_after_error`. I have never seen it fire in a run; the
-path exists because the alternative failure is unbounded.
-
-### 1.4 A rate-limit slot spent on a cancelled task — OBSERVED (in code, low impact)
-
-`sender_loop` waits for a rate-limit slot *before* claiming a task, so that a
-`comment.deleted` can still cancel a DM that is queued behind the limiter. The
-cost is that if the only due task is cancelled during the wait, the slot is
-consumed with no DM sent. It under-sends by at most one slot per occurrence.
-Chosen deliberately: under-sending is recoverable, DMing about a deleted comment
-is not.
-
-### 1.5 Rules do not backfill — REASONED
-
-A comment that arrives before its rule exists is matched against the rules
-present at processing time and then marked processed forever. Creating the rule
-afterwards does not replay it. In grading this only bites if the simulation
-starts before `POST /rules`, which is why the run script creates rules first.
-
-### 1.6 A 503 from `/webhook` depends on their redelivery — REASONED
-
-If the delivery row cannot be written, the route returns 503 rather than lying
-with a 200. Whether that event ever arrives again is entirely up to the sender's
-retry policy. If they do not retry, the event is lost and **nothing in my system
-records that it ever existed** — it will not appear in any counter, so the loss
-is invisible from `/stats`.
+The evidence comes from a real 500-event run against the deployed app, checked
+against `/v1/simulate/{run_id}/truth`, plus a local harness that grades my
+counters against a truth computed by a separate implementation.
 
 ---
 
-## 2. Sending a duplicate
+## The big one: I miss 4 recipients out of 96
 
-### 2.1 Crash between the POST and recording the 202 — REASONED
+**[saw it]** Their truth said 96 people should get a DM. I sent 92.
 
-If the process dies after `POST /v1/dm/send` reaches upstream but before the 202
-is written, the task is left `in_flight`. On restart `recover_in_flight()`
-returns it to `pending` and it is sent again **with the same
-`Idempotency-Key`**, so upstream returns the original `dm_id` instead of sending
-a second DM.
+I diffed the two lists to find out who. All four commented only **"pricing
+please"**. My keyword is `PRICE`, and "pricing" doesn't contain "price" — it's
+p-r-i-c-**i-n-g**. The contract says matching is a substring, anywhere,
+case-insensitive, so a literal matcher is right not to match it. But their
+expected list is built from what the comment *template meant*, not from
+substring-matching the keyword. So there's no way to follow the stated rule and
+also hit their number.
 
-This is safe only as long as their idempotency store still holds that key. The
-API documents the behaviour but not a retention window. If keys expire, or are
-scoped per-connection, a restart at exactly the wrong moment produces a real
-duplicate. I cannot test this without a documented TTL, so I am flagging it
-rather than claiming it is handled.
+It costs more than four. "pricing please" showed up 17 times; 13 of those were
+from people I'd already matched on a different comment, and those 13 would have
+been blocked duplicates. So on that run I'm about **4 low on `sent` and 13 low
+on `duplicates_blocked`**.
 
-### 2.2 Two uvicorn workers would breach everything at once — REASONED
+I could fix it in one word. A rule with the keyword `pric` catches price,
+pricing and prices, gives exactly 96, and lands both numbers. I didn't, because
+your grading script probably posts its own rule and your example literally shows
+`"keyword": "PRICE"`. With both `pric` and `price` sitting there, every price
+comment matches two rules and those people get two DMs — 4 low turns into 13
+over, and you said inflated is worse than low. `/rules` upserts on the keyword,
+so if your script posts `PRICE` it merges into the rule that's already there
+instead of making a second one. Keeping the obvious keyword is what makes that
+work.
 
-The design assumes exactly one sender process: the rate limiter's correctness
-comes from being the single owner of outbound calls, not from locking. Starting
-with `--workers 2` produces two senders, two limiters, and roughly double the
-send rate — a rate-limit breach and, because the claim is a conditional UPDATE
-rather than a lock, a wider window for two processes to send the same task.
-
-The start command in `Dockerfile` and `render.yaml` pins `--workers 1`. Nothing
-in the application detects a violation. Scaling out properly means moving the
-sender to its own process holding a database lease.
-
-### 2.3 Cancelling frees the `(user, rule)` slot — OBSERVED (deliberate divergence)
-
-When `comment.deleted` cancels a task, the row is deleted rather than
-tombstoned, because the row holds the `UNIQUE (user_id, rule_id)` slot and a
-tombstone would block that user from ever receiving that DM — suppressing a
-message that was never actually sent.
-
-The consequence: a user who comments `PRICE`, deletes it, then comments `PRICE`
-again **does** get the DM, and the second comment is not counted as a blocked
-duplicate. If the graders' truth treats the second one as a duplicate, my
-`duplicates_blocked` is low by the number of such cases and my `sent` is high by
-the same. I think delivering is the correct product behaviour; I am recording it
-because it is a defensible decision, not an obviously right one.
-
-### 2.4 A deletion that lands while the DM is in flight still sends — DELIBERATE
-
-`in_flight` (a POST is on the wire) and `accepted` (upstream has it) are not
-cancelled, because neither can be recalled. So a `comment.deleted` arriving in
-that window results in a DM for a comment that no longer exists. The alternative
-is pretending we can un-send.
+If you'd rather I matched your intent than the spec, it's a one-line change.
 
 ---
 
-## 3. Reporting a wrong number
+## Ways a DM still gets lost
 
-### 3.0 Literal keyword matching under-counts against their truth — OBSERVED
+**If `DATABASE_URL` isn't set, everything dies on the next restart.** **[saw it]**
+It defaults to SQLite so tests need no setup. My first deploy had no env vars at
+all and it started perfectly — workers running, database "reachable", `/stats`
+returning four honest-looking zeros — while storing everything on a disk Render
+wipes on restart, redeploy and wake-from-idle. I only caught it by noticing a
+delivery count that didn't match another database. `/health` now reports
+`dialect` and a `warnings` list, but nothing *stops* you deploying it wrong.
 
-This is the largest known gap, and it is not a bug in the matcher.
+**Put the app and the database in different regions and the webhook blows its
+5-second budget.** **[saw it]** Every webhook writes one row before it answers,
+so latency is floored by the app→DB round trip. Same code, same 560 deliveries:
 
-The contract says matching is "case-insensitive and matches anywhere in the
-comment text" — a literal substring test. On a real 500-event run their truth
-reported `expected_unique_recipient_count: 96`; I queued **92**. Diffing my
-recipients against their list identified all four:
-
-```
-usr_09bf7b0f0d   "pricing please"
-usr_193f0cad53   "pricing please"
-usr_63fe4724a6   "pricing please"
-usr_9a8c11e356   "pricing please"
-```
-
-Every one of them commented **only** `"pricing please"`. The rule keyword is
-`PRICE`, and `"pricing"` does not contain the substring `"price"` — it contains
-`pric` then `ing`. So a literal matcher correctly does not match, while their
-truth counts those users as expected recipients. Their expectation is derived
-from the *intent* of the comment template, not from substring-matching the
-keyword. **No implementation that follows the stated matching rule can reproduce
-their number.**
-
-The knock-on effect is larger than four. `"pricing please"` appeared 17 times
-across the run; 13 of those were from users already matched on another comment.
-Had they matched, those 13 would each have been a blocked duplicate. So on this
-run the gap is roughly **4 on `sent` and 13 on `duplicates_blocked`**.
-
-I could close it. A single rule with the keyword `pric` matches `price`,
-`pricing` and `prices`, produces exactly 96 recipients, and lands both numbers.
-I deliberately did not:
-
-* the graders' script very likely creates its own rule, and the contract example
-  literally shows `"keyword": "PRICE"`. With both `pric` and `price` present,
-  every price comment matches two rules and every affected user gets two DMs —
-  turning a 4-short result into a 13-over one, and the brief is explicit that
-  inflated numbers are worse than honest low ones;
-* `/rules` upserts on the folded keyword, so if their script posts `PRICE` it
-  collapses into the rule already there rather than duplicating it. Keeping the
-  obvious keyword is what makes that safety net work.
-
-Under-reporting by four was the deliberate choice over a stemming rule the
-contract does not describe.
-
-### 3.1 `duplicates_blocked`: two definitions, now settled by evidence — OBSERVED
-
-The brief defines it as "DMs you correctly chose not to send" without settling
-whether a redelivered event counts. Both readings are tracked separately:
-
-| Reading | 560-delivery local run |
-|---|---|
-| Redelivered events + repeat comments (`all`, the default) | **203** |
-| Repeat comments only (`repeat`) | **178** |
-
-The live run resolved which is right. Their truth reports
-`expected_unique_recipient_count`, i.e. their model is one DM per unique
-recipient. Reconstructing it from the observed run: 169 matching deliveries
-against 92 unique recipients gives 77 blocked duplicates, which is exactly what
-`all` reports. `repeat` would under-report by the redelivery count. **`all` is
-correct and is the default.**
-
-One caveat that makes the agreement partly luck: their stream only ever triggers
-one keyword, so "unique recipient" and "unique (user, rule) pair" happen to be
-the same number here. A stream where one comment matched two different rules
-would separate them, and my per-rule model would report more DMs than their
-per-recipient model expects. Dedup is scoped to `(user_id, rule_id)` because the
-brief says "never DMed twice **for the same rule**", but their truth is
-per-recipient, and those are not the same contract.
-
-### 3.2 `/stats` is not a consistent snapshot — REASONED
-
-`core_stats()` runs two queries on two connections: one aggregating task status,
-one reading counters. Under the 500-in-10s burst a duplicate can be counted
-between them, so for a few milliseconds the four numbers describe two slightly
-different instants. Every individual figure is committed and true; they are just
-not guaranteed to be true *simultaneously*. Wrapping both in one repeatable-read
-transaction would fix it and I did not do it, because the read is on the
-dashboard's 2-second poll path.
-
-### 3.3 Tasks can sit in `accepted` indefinitely — REASONED
-
-The reconciler polls `GET /v1/dm/{dm_id}` until the status is terminal, backing
-off to one check per 60s and never giving up. A DM that upstream leaves `queued`
-forever is reported as `queued` forever. That is honest — it is genuinely
-unconfirmed — but it means `queued` has no upper time bound and never converges
-to `sent` or `failed`.
-
-### 3.4 Webhook tail latency under burst — OBSERVED
-
-At 56 requests/second sustained for 10 seconds on SQLite, with ingest running
-concurrently:
-
-| | p50 | p95 | max |
+| Database | p50 | p95 | max |
 |---|---|---|---|
-| ingest-only run | 53ms | 174ms | 824ms |
-| with all three workers | 81ms | 468ms | **2554ms** |
+| SQLite, local disk | 53ms | 174ms | 824ms |
+| Neon in Oregon, driven from India | 4284ms | **5176ms** | 6598ms |
 
-The contract is 5000ms and this stays under it, but the worst case is already
-half the budget on a developer laptop. A free-tier instance with a fraction of a
-CPU under the same burst could plausibly cross it, and a webhook that times out
-is an event that never enters the inbox and is therefore invisible to every
-counter. The p95 is comfortable; the max is not, and the max is what drops
-events.
+Nothing was *wrong* — all 560 returned 200 and every counter was correct — it
+was just too slow. Production has both in Oregon and `/health` reports
+`round_trip_ms` (currently ~5ms) so you can check it in one request.
 
-### 3.5 The rate limiter can still provoke one 429 — OBSERVED, then narrowed
+Same run also **livelocked**: ingest does one transaction per batch and ~4 round
+trips per event, so 200 events held ~800 round trips open, the connection died
+before commit, and it retried forever. Backlog frozen at 519 for 44 seconds,
+zero progress. Batch is 50 now, which bounds it, but the shape is unchanged — a
+slow enough link still stalls it.
 
-Early runs against the audited fake produced 429s: **one**, then **two** after a
-first fix. Root cause was not clock skew. The limiter recorded a send's
-timestamp when the slot was *reserved*, but the server's window starts when the
-request *arrives*, and under load that gap is dominated by event-loop scheduling
-delay, which no fixed padding bounds.
+**A free instance asleep isn't sending anything.** **[haven't seen it]** Render
+sleeps after ~15 min, Neon suspends after ~5. Asleep means the first webhook
+takes ~50s and the queue stops draining. There's an external pinger on `/health`
+every 4 minutes. If that pinger dies, this silently stops working and nothing in
+the app notices.
 
-Three changes took it to zero (`send_calls_by_status: {202: 105, 500: 20}`,
-`count_429: 0`, worst rolling window exactly 10):
+**One bad event used to be able to stop everything.** **[saw the mechanism, never
+the event]** Ingest batches in one transaction, so if a single event throws, the
+whole batch rolls back, retries, throws again — the entire inbox stuck forever
+behind one row, silently. Worst possible outcome. Now after two failed batches
+it switches to one-transaction-per-delivery and quarantines the bad row.
+The trade is explicit: **that event's DMs are lost** so the other 499 keep
+moving. It shows up as `quarantined_after_error` in `/stats/detail`. It has
+never fired.
 
-1. re-stamp the slot immediately before the POST, shrinking the gap to one UPDATE,
-2. widen the window to 62s against their 60s,
-3. treat any 429 as proof the model is wrong and permanently drop the ceiling by
-   one for the life of the process.
+**A cancelled DM can waste a send slot.** **[haven't seen it]** The sender waits
+for a rate-limit slot *before* claiming a task, so a `comment.deleted` can still
+cancel something stuck in the queue. Cost: if the only waiting task gets
+cancelled while I'm holding the slot, the slot is spent for nothing. Under-sends
+by one. I'd rather do that than DM someone about a comment they deleted.
 
-**The residual is item 3's trigger condition: the ceiling only adapts after a
-429 has already happened.** A first breach on a sufficiently slow box remains
-possible. It costs one 429, loses nothing (the attempt is refunded and
-rescheduled), and cannot repeat.
+**Rules don't backfill.** **[haven't seen it]** A comment that arrives before its
+rule exists is matched against whatever rules existed then, marked processed, and
+never looked at again. Create the rule after and nothing replays.
 
-### 3.6 An unset API key accepts unverified webhooks — DELIBERATE
-
-With `REQUIRE_SIGNATURE=1` but no `PSEUDOGRAM_API_KEY`, there is no secret to
-verify against. The route logs an error and accepts the request rather than
-rejecting all traffic on a misconfiguration. That is a real hole: a deployment
-that loses its key silently stops authenticating. It is loud in the logs and
-visible as `api_key_configured: false` on `/health`, but it does not fail closed.
-
-### 3.7 Wall-clock dependence — REASONED
-
-The rate-limit window uses `time.time()`. An NTP step backwards would age
-timestamps out of the window early and allow a burst. Monotonic time would fix
-the in-process case but cannot survive a restart, which is the property the
-persisted window exists for.
-
-### 3.8 Unbounded table growth — REASONED
-
-`deliveries` keeps every event body forever and `comments` keeps every comment.
-Nothing prunes them. Fine for a 500-event grading run; at the 50M-comments/month
-figure in the job post this is the first thing that falls over, and `/stats`
-would slow down with it since the counts are aggregates over those tables.
+**If the database write fails, the event vanishes with no trace.** **[haven't seen
+it]** `/webhook` returns 503 rather than lying with a 200. Whether it ever comes
+back is up to your retry policy. If it doesn't, the event isn't in any counter —
+so the loss is invisible from `/stats`. I can't report a number for something I
+never managed to write down.
 
 ---
 
-## What I would fix first, in order
+## Ways it could send a duplicate
 
-1. **3.1** — resolve `duplicates_blocked` against the graders' truth rather than
-   my judgement. It is the only item that changes a graded number, and it is one
-   measurement away from being settled.
-2. **1.1** — make SQLite in production refuse to start rather than being a quiet
-   default.
-3. **2.2** — give the sender a database lease so a second process is safe
-   instead of catastrophic.
-4. **3.4** — move the delivery insert off the request path behind a small
-   batching writer, with the batch fsynced before the 200, to cut the tail.
+**A crash at exactly the wrong moment.** **[haven't seen it]** If the process dies
+after `POST /v1/dm/send` reaches you but before I record the 202, restart puts
+the task back and sends it again with the **same** `Idempotency-Key`, so you hand
+back the original `dm_id` and nobody gets two DMs. I verified that replay
+behaviour against the live API. But I don't know how long you keep those keys.
+If they expire, that window is a real duplicate. I'm flagging it rather than
+claiming it's handled.
+
+**Running two workers would break it immediately.** **[haven't seen it]** The rate
+limiter is correct because exactly one process owns every outbound call — not
+because of locking. Two workers means two limiters, roughly double the send
+rate, and a wider window for both to grab the same task. The start command pins
+`--workers 1`. Nothing in the code enforces it, and nothing warns you.
+
+**Delete then re-comment gets you a DM, and I think that's right.** **[saw it]**
+When a deletion cancels a queued DM I delete the row instead of tombstoning it,
+because the row holds the `UNIQUE (user_id, rule_id)` slot and a tombstone would
+block that person forever from a message that was never actually sent. So
+someone who comments PRICE, deletes it, and comments PRICE again does get the
+DM, and I don't count the second one as a duplicate. If your truth counts it as
+a duplicate, I'm low by that many. I think delivering is the right product call,
+but it's a judgement, not an obvious answer.
+
+**A deletion that lands mid-flight still sends.** **Deliberate.** Once a POST is
+on the wire or you've accepted it, I can't recall it, so I don't try. Someone can
+get a DM about a comment that no longer exists.
+
+---
+
+## Ways a number could be wrong
+
+**`duplicates_blocked` — I picked the right definition, but partly by luck.**
+**[saw it]** "DMs you correctly chose not to send" can mean with or without
+redelivered events. On my local run that's 203 vs 178. The live run settled it:
+169 matching deliveries, 92 unique recipients, 77 blocked — which is exactly what
+the "count redeliveries" definition gives, and that's the default.
+
+The luck part: your stream only ever triggers one keyword, so "unique recipient"
+and "unique (user, rule) pair" happen to be the same number. Your truth counts
+recipients; I dedupe per rule, because the brief says "never DMed twice **for the
+same rule**". A stream where one comment matched two different rules would pull
+those apart and I'd report more than you expect. Those are two different
+contracts and I picked the one in the text.
+
+**The four numbers aren't a single snapshot.** **[haven't seen it]** `/stats` runs
+two queries on two connections — one for task states, one for counters. Under a
+burst a duplicate can land between them, so for a few milliseconds the four
+numbers describe two slightly different instants. Each one is committed and
+true; they're just not guaranteed true *together*.
+
+**Something stuck in `accepted` stays in `queued` forever.** **[haven't seen it]**
+The reconciler polls until the status is terminal and never gives up, backing off
+to once a minute. If a DM never resolves on your side, I report it as queued
+indefinitely. Honest, but it has no time bound.
+
+**The rate limiter can still trip once.** **[saw it, then narrowed it]** Early runs
+provoked 429s — one, then two. The cause wasn't clock skew: I was timestamping
+when the slot was *reserved*, but your window starts when the request *arrives*,
+and under load that gap is event-loop scheduling, which no fixed padding bounds.
+Three changes took it to zero (worst rolling window exactly 10, `count_429: 0`):
+re-stamp the slot right before the POST, widen my window to 62s against your 60,
+and treat any 429 as proof my model is wrong by permanently dropping my ceiling
+by one.
+
+The residual is that last one's trigger: **the ceiling only adapts after a 429
+has already happened.** A first breach on a slow enough box is still possible. It
+costs one 429, loses nothing, and can't repeat.
+
+**The signature check isn't really authentication.** **[saw it]** Your brief says
+the HMAC secret is the API key. It isn't — you sign with the account email. I
+found this the hard way: a live run rejected **44 of 44 events** while the
+service reported itself completely healthy. I captured real rejected bodies and
+brute-forced it. It now tries the documented secret first and falls back, so if
+you ever fix the server to match your docs it keeps working.
+
+But the working secret is the email, which is not a secret — it's on the
+application form and in the submission payload. Anyone who knows it can forge a
+valid signature. It proves the body wasn't mangled in transit. It doesn't prove
+who sent it. I implemented it because you asked for it, not because it's a
+security boundary.
+
+**No API key means unverified webhooks get accepted.** **Deliberate, and a hole.**
+With `REQUIRE_SIGNATURE=1` but no key configured there's nothing to verify
+against, so I log an error and accept rather than rejecting all traffic on a
+misconfiguration. A deployment that loses its key silently stops authenticating.
+Loud in the logs, visible on `/health`, but it does not fail closed.
+
+**Clock and disk.** **[haven't seen either]** The rate-limit window uses wall
+clock, so an NTP step backwards would let me burst. And nothing prunes
+`deliveries` or `comments` — fine for 500 events, the first thing to fall over at
+the 50M-comments-a-month in your job post, and `/stats` slows with it because the
+counts are aggregates over those tables.
+
+---
+
+## What I'd fix first
+
+1. **Ask you about "pricing please."** One question settles whether I should
+   match your intent or the spec. It's the only item costing graded numbers and
+   it's a one-line change either way.
+2. **Refuse to boot on SQLite in production** instead of starting cheerfully and
+   losing everything. This one already bit me for real.
+3. **Give the sender a database lease** so a second process is safe rather than
+   catastrophic. Right now "don't run two workers" is a comment, not a guarantee.
+4. **Get the delivery write off the request path**, behind a small batching
+   writer that fsyncs before returning the 200. That's what caps the tail
+   latency, and the tail is what actually drops events.
