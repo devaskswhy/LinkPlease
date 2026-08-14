@@ -316,13 +316,23 @@ def _delta(actual, expected):
 # Modes
 # --------------------------------------------------------------------------
 
+def _db_url(default: str) -> str:
+    """Let the harness run against a real Postgres.
+
+    Everything is proven on SQLite by default, but the dialects have separate
+    DDL and different NULL ordering, so the production database deserves the
+    same 500-event run rather than a hope that it behaves the same.
+    """
+    return os.getenv("LOADTEST_DATABASE_URL") or default
+
+
 async def run_ingest_mode(count: int, users: int, duration: float, seed: int) -> None:
     print(f"\n=== INGEST MODE — {count} events over {duration:g}s, workers off ===")
     events = generate_events(count, users, seed, with_deletions=True)
     truth = expected_truth(events)
 
     app_proc = spawn("app.main:app", APP_PORT, {
-        "DATABASE_URL": f"sqlite+aiosqlite:///{ROOT}/.loadtest_ingest.db",
+        "DATABASE_URL": _db_url(f"sqlite+aiosqlite:///{ROOT}/.loadtest_ingest.db"),
         "PSEUDOGRAM_API_KEY": SECRET,
         "REQUIRE_SIGNATURE": "1",
         "RUN_WORKERS": "1",   # ingest on: we are grading matching and dedup
@@ -388,7 +398,7 @@ async def run_full_mode(count: int, users: int, duration: float, seed: int) -> N
         "FAKE_SETTLE_SECONDS": "1.5",
     })
     app_proc = spawn("app.main:app", APP_PORT, {
-        "DATABASE_URL": f"sqlite+aiosqlite:///{ROOT}/.loadtest_full.db",
+        "DATABASE_URL": _db_url(f"sqlite+aiosqlite:///{ROOT}/.loadtest_full.db"),
         "PSEUDOGRAM_API_KEY": SECRET,
         "PSEUDOGRAM_BASE_URL": FAKE_URL,
         "REQUIRE_SIGNATURE": "1",

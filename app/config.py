@@ -82,7 +82,13 @@ class Settings:
     run_sender: bool = field(default_factory=lambda: _bool("RUN_SENDER", True))
     # Guards POST /admin/reset. Empty (the default) disables the route entirely.
     admin_token: str = field(default_factory=lambda: _str("ADMIN_TOKEN", ""))
-    ingest_batch_size: int = field(default_factory=lambda: _int("INGEST_BATCH_SIZE", 200))
+    # Each event costs ~4 database round trips, and the whole batch is one
+    # transaction. At 200 that is ~800 round trips held open at once: 1.6s
+    # in-region, but minutes on a high-latency link, where the connection dies
+    # before the transaction commits and the batch retries forever without
+    # progressing. 50 keeps the transaction short enough that latency degrades
+    # throughput instead of livelocking it.
+    ingest_batch_size: int = field(default_factory=lambda: _int("INGEST_BATCH_SIZE", 50))
     http_timeout: float = field(default_factory=lambda: _float("HTTP_TIMEOUT", 15.0))
 
     # --- Stats -------------------------------------------------------------

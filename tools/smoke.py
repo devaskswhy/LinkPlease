@@ -66,6 +66,10 @@ def comment_event(event_id: str, comment_id: str, user_id: str, text: str) -> di
 
 def main() -> int:
     with TestClient(app) as client:
+        # Against a persistent database (Postgres) the tables survive between
+        # runs, so every count below would accumulate. Start from zero.
+        client.post("/admin/reset", headers={"X-Admin-Token": "smoke"})
+
         print("\n[1] POST /rules — contract shape")
         r = client.post("/rules", json={"keyword": "PRICE", "dm_message": "Here's the price list"})
         check("status", r.status_code, 201)

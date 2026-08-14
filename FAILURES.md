@@ -27,7 +27,36 @@ Mitigated by pointing `DATABASE_URL` at managed Postgres, which is what the
 deployment does. It is listed first because it is a configuration away from
 being the worst failure in the file, and nothing in the code enforces it.
 
-### 1.2 A free instance asleep is an instance not sending — REASONED
+### 1.2 App and database in different regions breaks the contract — OBSERVED
+
+Every webhook does one database round trip before it answers, so webhook latency
+is bounded below by the app→database RTT. Measured, same code, same 560-delivery
+stream:
+
+| Database | p50 | p95 | max | throughput |
+|---|---|---|---|---|
+| SQLite, local disk | 53ms | 174ms | 824ms | 56/s |
+| Neon `us-west-2`, driven from India | **4284ms** | **5176ms** | 6598ms | 8.8/s |
+
+The p95 is past the 5-second contract. All 560 still returned 200 and every
+counter was correct — this degrades latency, not correctness — but a webhook
+that times out never enters the inbox and is invisible to every counter
+afterwards.
+
+Production has both in Oregon, where the RTT is 1-3ms. `/health` reports
+`database.round_trip_ms` specifically so this is checkable in one request rather
+than discovered under load.
+
+**Worse, the same run livelocked.** Ingest processes a batch in a single
+transaction and each event costs ~4 round trips, so a 200-event batch held ~800
+round trips open. On the high-latency link the connection dropped before the
+transaction could commit, the batch rolled back, retried, and dropped again —
+backlog frozen at 519 across 44 seconds with zero progress. Batch size is now 50,
+which bounds the transaction enough that latency costs throughput instead of all
+forward progress. The underlying shape — one long transaction per batch — is
+unchanged, so a slow enough link still stalls it.
+
+### 1.3 A free instance asleep is an instance not sending — REASONED
 
 Render free tiers sleep after ~15 minutes idle. While asleep no worker runs, so
 a queue of pending DMs makes no progress, and the first webhook after wake takes
