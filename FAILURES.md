@@ -74,10 +74,16 @@ zero progress. Batch is 50 now, which bounds it, but the shape is unchanged — 
 slow enough link still stalls it.
 
 **A free instance asleep isn't sending anything.** **[haven't seen it]** Render
-sleeps after ~15 min, Neon suspends after ~5. Asleep means the first webhook
-takes ~50s and the queue stops draining. There's an external pinger on `/health`
-every 4 minutes. If that pinger dies, this silently stops working and nothing in
-the app notices.
+sleeps after ~15 min with no inbound HTTP, Neon suspends after ~5 with no
+queries. Asleep means the first webhook takes ~50s and the send queue stops
+draining entirely.
+
+The database half is handled in-process: a heartbeat runs `SELECT 1` every three
+minutes, so Neon never suspends while the service is up. The web-service half
+can't be — only an outside request wakes it — so there's an external monitor on
+`/health` every 5 minutes. **If that monitor dies, this silently stops working
+and nothing in the app notices**, because a sleeping app can't report that it's
+asleep. That's the single external dependency I can't remove.
 
 **One bad event used to be able to stop everything.** **[saw the mechanism, never
 the event]** Ingest batches in one transaction, so if a single event throws, the
