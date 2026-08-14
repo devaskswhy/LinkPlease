@@ -158,7 +158,52 @@ is pretending we can un-send.
 
 ## 3. Reporting a wrong number
 
-### 3.1 `duplicates_blocked` has two defensible definitions — OBSERVED, and unresolved
+### 3.0 Literal keyword matching under-counts against their truth — OBSERVED
+
+This is the largest known gap, and it is not a bug in the matcher.
+
+The contract says matching is "case-insensitive and matches anywhere in the
+comment text" — a literal substring test. On a real 500-event run their truth
+reported `expected_unique_recipient_count: 96`; I queued **92**. Diffing my
+recipients against their list identified all four:
+
+```
+usr_09bf7b0f0d   "pricing please"
+usr_193f0cad53   "pricing please"
+usr_63fe4724a6   "pricing please"
+usr_9a8c11e356   "pricing please"
+```
+
+Every one of them commented **only** `"pricing please"`. The rule keyword is
+`PRICE`, and `"pricing"` does not contain the substring `"price"` — it contains
+`pric` then `ing`. So a literal matcher correctly does not match, while their
+truth counts those users as expected recipients. Their expectation is derived
+from the *intent* of the comment template, not from substring-matching the
+keyword. **No implementation that follows the stated matching rule can reproduce
+their number.**
+
+The knock-on effect is larger than four. `"pricing please"` appeared 17 times
+across the run; 13 of those were from users already matched on another comment.
+Had they matched, those 13 would each have been a blocked duplicate. So on this
+run the gap is roughly **4 on `sent` and 13 on `duplicates_blocked`**.
+
+I could close it. A single rule with the keyword `pric` matches `price`,
+`pricing` and `prices`, produces exactly 96 recipients, and lands both numbers.
+I deliberately did not:
+
+* the graders' script very likely creates its own rule, and the contract example
+  literally shows `"keyword": "PRICE"`. With both `pric` and `price` present,
+  every price comment matches two rules and every affected user gets two DMs —
+  turning a 4-short result into a 13-over one, and the brief is explicit that
+  inflated numbers are worse than honest low ones;
+* `/rules` upserts on the folded keyword, so if their script posts `PRICE` it
+  collapses into the rule already there rather than duplicating it. Keeping the
+  obvious keyword is what makes that safety net work.
+
+Under-reporting by four was the deliberate choice over a stemming rule the
+contract does not describe.
+
+### 3.1 `duplicates_blocked`: two definitions, now settled by evidence — OBSERVED
 
 The brief defines it as "DMs you correctly chose not to send" without settling
 whether a redelivered event counts. Both readings are tracked separately:
@@ -168,13 +213,20 @@ whether a redelivered event counts. Both readings are tracked separately:
 | Redelivered events + repeat comments (`all`, the default) | **203** |
 | Repeat comments only (`repeat`) | **178** |
 
-A 25-count spread on one run, scaling with the ~8% redelivery rate. If the
-graders use the other reading, that field is wrong by roughly that much.
-`/stats/detail` always publishes both and `DUPLICATE_DEFINITION` switches which
-one `/stats` reports, so the fix is one environment variable — but the choice is
-currently a judgement call, not a measurement.
+The live run resolved which is right. Their truth reports
+`expected_unique_recipient_count`, i.e. their model is one DM per unique
+recipient. Reconstructing it from the observed run: 169 matching deliveries
+against 92 unique recipients gives 77 blocked duplicates, which is exactly what
+`all` reports. `repeat` would under-report by the redelivery count. **`all` is
+correct and is the default.**
 
-**This is the single number I am least confident about.**
+One caveat that makes the agreement partly luck: their stream only ever triggers
+one keyword, so "unique recipient" and "unique (user, rule) pair" happen to be
+the same number here. A stream where one comment matched two different rules
+would separate them, and my per-rule model would report more DMs than their
+per-recipient model expects. Dedup is scoped to `(user_id, rule_id)` because the
+brief says "never DMed twice **for the same rule**", but their truth is
+per-recipient, and those are not the same contract.
 
 ### 3.2 `/stats` is not a consistent snapshot — REASONED
 
