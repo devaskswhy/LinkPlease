@@ -9,3 +9,4 @@ __pycache__/
 .pytest_cache/
 .runs/
 LOOM-SCRIPT.md
+.runid.txt
