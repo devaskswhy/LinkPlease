@@ -8,3 +8,4 @@ __pycache__/
 .loadtest_*.db*
 .pytest_cache/
 .runs/
+LOOM-SCRIPT.md
