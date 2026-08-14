@@ -57,8 +57,20 @@ def normalise_url(url: str) -> str:
 
 def _connect_args(url: str) -> dict[str, Any]:
     if url.startswith("postgresql+asyncpg"):
-        # Neon and Render both require TLS; asyncpg takes the libpq mode name.
-        return {"ssl": "require", "server_settings": {"application_name": "linkplease"}}
+        return {
+            # Neon and Render both require TLS; asyncpg takes the libpq mode name.
+            "ssl": "require",
+            "server_settings": {"application_name": "linkplease"},
+            # asyncpg caches prepared statements by default. Neon's pooled
+            # endpoint (the one with `-pooler` in the host) is PgBouncer in
+            # transaction mode, which hands each transaction a different backend
+            # -- so a cached statement handle from one transaction is invalid in
+            # the next, and you get intermittent "prepared statement _asyncpg_
+            # does not exist" errors under exactly the concurrency this app has.
+            # Disabling the cache costs a re-parse per query and makes the
+            # pooled and direct endpoints behave identically.
+            "statement_cache_size": 0,
+        }
     return {}
 
 
