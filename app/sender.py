@@ -258,7 +258,10 @@ async def reconcile_once(client: PseudoGramClient, limit: int = 50) -> int:
                 FROM dm_tasks
                 WHERE status = 'accepted' AND dm_id IS NOT NULL
                   AND (next_check_at IS NULL OR next_check_at <= :t)
-                ORDER BY next_check_at ASC
+                -- COALESCE, because SQLite sorts NULLs first and Postgres sorts
+                -- them last. Without it the two dialects would drain this queue
+                -- in a different order.
+                ORDER BY COALESCE(next_check_at, 0) ASC
                 LIMIT :lim
             """),
             {"t": now(), "lim": limit},
