@@ -3,8 +3,14 @@
 Everything hostile about the upstream is classified here, in one place, so the
 sender loop reads as policy rather than as a pile of status-code branches.
 
+Note on the success code: the brief documents `202 Accepted`, but the live API
+actually answers `200` (verified with `python -m tools.pg probe`). Either way the
+body carries `status: "queued"`, so both are treated as *accepted, not
+delivered*. Keying the success branch on 202 alone -- the obvious reading of the
+brief -- would classify every real send as an error and retry all of them.
+
 Response taxonomy for POST /v1/dm/send:
-    ACCEPTED   202 -- accepted, *not* delivered. Reconciliation decides that.
+    ACCEPTED   200/202 -- accepted, *not* delivered. Reconciliation decides that.
     RATE_LIMIT 429 -- back off by Retry-After. Not the task's fault: it does
                       not consume a retry attempt.
     PERMANENT  400 -- malformed payload. Retrying cannot help; fail it now.

@@ -25,6 +25,11 @@ import time
 from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
+
+# The app loads .env via app.config, but this CLI reads the environment before
+# importing any of that -- without this, --key would be the only way in.
+load_dotenv()
 
 BASE = os.getenv("PSEUDOGRAM_BASE_URL", "https://pseudogram-api.onrender.com").rstrip("/")
 RUNS_DIR = Path(__file__).resolve().parent.parent / ".runs"
@@ -209,6 +214,51 @@ async def cmd_run(args) -> int:
     return 0
 
 
+async def cmd_probe(args) -> int:
+    """Validate the client against the *real* API, not just the local fake.
+
+    Sends one DM and polls it to a terminal status. Costs one of the ten sends
+    in the current window, and confirms the things the fake can only assume:
+    the real status codes, the real response shape, and that a 202 really does
+    resolve to delivered/failed on a later read.
+    """
+    key = args.key or os.getenv("PSEUDOGRAM_API_KEY", "")
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from app.pseudogram import PseudoGramClient
+    from app.sender import idempotency_key
+
+    client = PseudoGramClient(api_key=key)
+    await client.start()
+    try:
+        idem = idempotency_key(999_001, 0)
+        result = await client.send_dm("usr_probe_001", "probe: contract check", "cmt_probe_001", idem)
+        print(f"\nsend      outcome={result.outcome.value} status={result.status_code} "
+              f"dm_id={result.dm_id} detail={result.detail[:120]}")
+
+        if result.dm_id:
+            # Same key again: must return the original dm_id, not a second DM.
+            replay = await client.send_dm("usr_probe_001", "probe: contract check", "cmt_probe_001", idem)
+            same = replay.dm_id == result.dm_id
+            print(f"replay    dm_id={replay.dm_id}  same_as_original={same}"
+                  f"{'' if same else '   <-- IDEMPOTENCY DOES NOT HOLD, retries would duplicate'}")
+
+            for attempt in range(20):
+                await asyncio.sleep(2)
+                status = await client.get_dm(result.dm_id)
+                if status is None:
+                    print(f"  poll {attempt + 1}: status read failed")
+                    continue
+                print(f"  poll {attempt + 1}: {status.status}")
+                if status.terminal:
+                    print(f"\nterminal after ~{(attempt + 1) * 2}s: {status.status}")
+                    break
+            else:
+                print("\nnever reached a terminal status in 40s")
+    finally:
+        await client.aclose()
+    return 0
+
+
 async def cmd_submit(args) -> int:
     payload = {
         "github_repo": args.repo, "working_url": args.url,
@@ -259,6 +309,10 @@ def main() -> int:
     p.add_argument("--key")
     p.add_argument("--email")
     p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("probe")
+    p.add_argument("--key")
+    p.set_defaults(fn=cmd_probe)
 
     p = sub.add_parser("truth")
     p.add_argument("--run-id", required=True)
