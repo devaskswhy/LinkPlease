@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from .db import close_db, dialect, execute, fetch_all, fetch_one, get_engine, in
 from .matching import normalise_keyword
 from .pseudogram import PseudoGramClient
 from .ratelimit import RateLimiter
-from .security import verify_signature
+from .security import compute_signature, verify_signature
 from .stats import core_stats, detailed_stats
 
 logging.basicConfig(
@@ -41,6 +42,10 @@ logging.basicConfig(
 log = logging.getLogger("linkplease")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+# Last few rejected webhooks, for diagnosing a signature mismatch against real
+# bytes. Bounded and in-memory: this is a debugging aid, not a store.
+_signature_failures: deque = deque(maxlen=5)
 
 
 @asynccontextmanager
@@ -180,6 +185,17 @@ async def webhook(request: Request):
     verdict = verify_signature(raw, signature)
 
     if not verdict.ok:
+        # Keep the last few rejections so a signature mismatch can be diagnosed
+        # from the actual bytes rather than guessed at. Without this, "their
+        # signatures don't match mine" is unfalsifiable -- and it is the one bug
+        # that silently discards every event while the service looks healthy.
+        _signature_failures.append({
+            "reason": verdict.reason,
+            "received": signature,
+            "expected_full_key": compute_signature(raw, settings.api_key) if settings.api_key else None,
+            "body": raw.decode("utf-8", "replace")[:2000],
+            "at": now(),
+        })
         if verdict.reason == "no_secret_configured":
             # Cannot verify what we have no key for. Refusing everything here
             # would take the service down on a misconfiguration, so accept and
@@ -309,6 +325,14 @@ async def dashboard():
     if index.exists():
         return FileResponse(index)
     return {"service": "linkplease", "docs": "/docs"}
+
+
+@app.get("/admin/sigdebug")
+async def admin_sigdebug(x_admin_token: str = Header(default="")):
+    """The raw bytes and header of recent rejected webhooks."""
+    if not settings.admin_token or x_admin_token != settings.admin_token:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    return {"count": len(_signature_failures), "failures": list(_signature_failures)}
 
 
 @app.post("/admin/reset")
