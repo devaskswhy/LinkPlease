@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+*.db
+*.db-wal
+*.db-shm
+.loadtest_*.db*
+.pytest_cache/
+.runs/

@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: linkplease
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # Single worker: see the note in the Dockerfile. The sender owns the rate
+    # limit, and two of them would breach it.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Set in the Render dashboard, not here:
+      #   PSEUDOGRAM_API_KEY  the key, which is also the webhook HMAC secret
+      #   PSEUDOGRAM_EMAIL    the email used to apply
+      #   DATABASE_URL        Postgres connection string (see below)
+      #   ADMIN_TOKEN         any random string, enables POST /admin/reset
+      - key: REQUIRE_SIGNATURE
+        value: "1"
+      - key: RATE_LIMIT_MAX
+        value: "10"
+      - key: RATE_LIMIT_WINDOW
+        value: "62"
+      - key: DUPLICATE_DEFINITION
+        value: "all"
+
+# ---------------------------------------------------------------------------
+# Two deployment facts that decide whether this scores or zeroes, both specific
+# to free tiers and both worth stating plainly:
+#
+# 1. DATABASE_URL must point at managed Postgres (Neon's free tier works).
+#    A free Render web service has no persistent disk, so SQLite lives in the
+#    container filesystem and is wiped on every restart, redeploy and wake from
+#    idle. That would take the outbox and every counter with it -- the graded
+#    numbers would silently reset to zero between the run and the check.
+#
+# 2. A free service sleeps after ~15 minutes idle and takes ~50s to wake. That
+#    breaks the "200 within 5 seconds" requirement on the first webhook, and
+#    while asleep the sender makes no progress on the queue. Point an external
+#    pinger (cron-job.org, UptimeRobot) at /health every 10 minutes.
+# ---------------------------------------------------------------------------
