@@ -15,7 +15,7 @@ import pytest
 
 from app.matching import Rule, match_rules, normalise_keyword
 from app.pseudogram import SendOutcome, _retry_after
-from app.security import compute_signature, verify_signature
+from app.security import candidate_secrets, compute_signature, verify_signature
 from app.sender import backoff_delay, check_delay, idempotency_key
 
 SECRET = "test-secret-key"
@@ -120,6 +120,62 @@ def test_signature_is_over_raw_bytes_not_reparsed_json():
 def test_missing_secret_is_reported_distinctly():
     # The route treats this differently from a forgery: it cannot verify at all.
     assert verify_signature(b"{}", "sha256=" + "0" * 64, "").reason == "no_secret_configured"
+
+
+# --- the secret the brief documents is not the one that works --------------
+
+REAL_KEY = "ZGV2LnVwYWRoeWF5QGNvdmlzaW9uYWkuY29t.d6dd711bbe98f7f5626f"
+REAL_EMAIL = "dev.upadhyay@covisionai.com"
+
+
+def test_key_prefix_decodes_to_the_account_email():
+    # The key is `<base64(email)>.<hex>`, which is why deriving the secret from
+    # the key and reading it from config land on the same string.
+    labels = dict((label, value) for label, value in candidate_secrets(REAL_KEY, REAL_EMAIL))
+    assert labels["api_key_prefix_b64decoded"] == REAL_EMAIL
+
+
+def test_candidates_try_the_documented_secret_first():
+    # If PseudoGram ever fixes the server to match its own documentation, the
+    # API key must win without a redeploy.
+    order = [label for label, _ in candidate_secrets(REAL_KEY, REAL_EMAIL)]
+    assert order[0] == "api_key"
+    assert "account_email" in order or "api_key_prefix_b64decoded" in order
+
+
+def test_candidates_are_deduplicated():
+    # email and the decoded prefix are the same string; it must not be tried twice.
+    values = [value for _, value in candidate_secrets(REAL_KEY, REAL_EMAIL)]
+    assert len(values) == len(set(values))
+
+
+def test_real_captured_signature_verifies():
+    """A body and signature captured from a live PseudoGram webhook.
+
+    This is the regression test for the bug that rejected 44 of 44 events:
+    verifying with the API key, exactly as the brief describes, fails.
+    """
+    body = (
+        b'{"event_id": "evt_bd72ff36b29043", "event_type": "comment.created", '
+        b'"sent_at": "2026-08-14T11:38:47.128468+00:00", "data": {"comment_id": '
+        b'"cmt_37c1bf65d8", "post_id": "post_e833f300ed", "text": "amazing content", '
+        b'"created_at": "2026-08-14T11:38:47.128474+00:00", "from": {"user_id": '
+        b'"usr_23e936861d", "username": "nikhil.793"}}}'
+    )
+    sent = "sha256=a8f33aad2012e5d946ed69fe772647722a87589e37952abdb6bd88e20338c6ba"
+
+    assert not verify_signature(body, sent, REAL_KEY).ok      # the documented secret
+    assert verify_signature(body, sent, REAL_EMAIL).ok        # the one that works
+
+    result = verify_signature(body, sent, None)
+    assert result.ok and result.matched in {"api_key_prefix_b64decoded", "account_email"}
+
+
+def test_forgery_still_rejected_across_all_candidates():
+    # Trying several secrets must not become "accept anything".
+    body = b'{"a":1}'
+    forged = hmac.new(b"attacker", body, hashlib.sha256).hexdigest()
+    assert not verify_signature(body, f"sha256={forged}", None).ok
 
 
 # --------------------------------------------------------------------------

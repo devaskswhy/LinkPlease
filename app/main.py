@@ -32,7 +32,7 @@ from .db import close_db, dialect, execute, fetch_all, fetch_one, get_engine, in
 from .matching import normalise_keyword
 from .pseudogram import PseudoGramClient
 from .ratelimit import RateLimiter
-from .security import compute_signature, verify_signature
+from .security import candidate_secrets, compute_signature, verify_signature
 from .stats import core_stats, detailed_stats
 
 logging.basicConfig(
@@ -46,6 +46,10 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # Last few rejected webhooks, for diagnosing a signature mismatch against real
 # bytes. Bounded and in-memory: this is a debugging aid, not a store.
 _signature_failures: deque = deque(maxlen=5)
+
+# Which candidate secret actually verified inbound signatures. Recorded because
+# the documented one (the API key) is not the one that works.
+_signature_secret_in_use: str = ""
 
 
 @asynccontextmanager
@@ -184,6 +188,10 @@ async def webhook(request: Request):
     signature = request.headers.get(settings.signature_header)
     verdict = verify_signature(raw, signature)
 
+    if verdict.ok and verdict.matched != _signature_secret_in_use:
+        globals()["_signature_secret_in_use"] = verdict.matched
+        log.info("inbound signatures verify with candidate secret: %s", verdict.matched)
+
     if not verdict.ok:
         # Keep the last few rejections so a signature mismatch can be diagnosed
         # from the actual bytes rather than guessed at. Without this, "their
@@ -310,6 +318,11 @@ async def health(request: Request):
         "uptime_seconds": round(now() - getattr(state, "started_at", now()), 1),
         "workers": workers or ("disabled" if not settings.run_workers else "starting"),
         "api_key_configured": bool(settings.api_key),
+        "signature": {
+            "enforced": settings.require_signature,
+            "candidate_secrets": [label for label, _ in candidate_secrets()],
+            "verifying_with": _signature_secret_in_use or "nothing verified yet",
+        },
         "configured_correctly": not warnings,
         "warnings": warnings,
     }
