@@ -27,7 +27,7 @@ from sqlalchemy import text
 
 from . import ingest, sender
 from .config import settings
-from .db import close_db, execute, fetch_all, fetch_one, get_engine, init_db, now
+from .db import close_db, dialect, execute, fetch_all, fetch_one, get_engine, init_db, now
 from .matching import normalise_keyword
 from .pseudogram import PseudoGramClient
 from .ratelimit import RateLimiter
@@ -46,6 +46,15 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+
+    # Say it once, loudly, at boot -- this is the failure that looks like
+    # success until the numbers are graded.
+    if dialect() == "sqlite":
+        log.error("DATABASE_URL is unset or SQLite. If this is production, every "
+                  "queued DM and every counter dies on the next restart.")
+    if not settings.api_key:
+        log.error("PSEUDOGRAM_API_KEY is unset. Webhooks are accepted UNVERIFIED "
+                  "and every outbound DM will be rejected with 401.")
 
     app.state.stop = asyncio.Event()
     app.state.client = PseudoGramClient()
@@ -261,12 +270,32 @@ async def health(request: Request):
         log.exception("health check could not reach the database")
         db_ms, db_ok = None, False
 
+    # Misconfiguration that still starts cleanly is the dangerous kind: the
+    # service looks healthy and quietly loses either its data or its
+    # authentication. Name it here rather than leaving it to be deduced from
+    # counters that are zero for the wrong reason.
+    warnings = []
+    if dialect() == "sqlite":
+        warnings.append(
+            "DATABASE_URL is unset or SQLite. On a host without a persistent disk "
+            "every task and counter is destroyed on restart, redeploy and wake-from-idle."
+        )
+    if not settings.api_key:
+        warnings.append(
+            "PSEUDOGRAM_API_KEY is unset: webhook signatures cannot be verified "
+            "(requests are accepted UNVERIFIED) and every outbound DM will 401."
+        )
+
     return {
+        # Deliberately still true: Render restarts a service whose health check
+        # fails, and a restart loop is worse than a loud warning.
         "ok": db_ok,
-        "database": {"reachable": db_ok, "round_trip_ms": db_ms},
+        "database": {"reachable": db_ok, "round_trip_ms": db_ms, "dialect": dialect()},
         "uptime_seconds": round(now() - getattr(state, "started_at", now()), 1),
         "workers": workers or ("disabled" if not settings.run_workers else "starting"),
         "api_key_configured": bool(settings.api_key),
+        "configured_correctly": not warnings,
+        "warnings": warnings,
     }
 
 
