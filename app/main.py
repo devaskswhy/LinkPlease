@@ -72,9 +72,10 @@ async def lifespan(app: FastAPI):
     app.state.started_at = now()
 
     if settings.run_workers:
-        app.state.tasks.append(
-            asyncio.create_task(ingest.ingest_loop(app.state.stop), name="ingest")
-        )
+        app.state.tasks += [
+            asyncio.create_task(ingest.ingest_loop(app.state.stop), name="ingest"),
+            asyncio.create_task(heartbeat_loop(app.state.stop), name="heartbeat"),
+        ]
 
         if settings.run_sender:
             await app.state.client.start()
@@ -110,6 +111,35 @@ async def lifespan(app: FastAPI):
                 pass
         await app.state.client.aclose()
         await close_db()
+
+
+async def heartbeat_loop(stop: asyncio.Event) -> None:
+    """Touch the database every few minutes so it never autosuspends.
+
+    Two separate things go to sleep on free infrastructure, and they need
+    different remedies:
+
+    * The **web service** sleeps after ~15 minutes with no inbound HTTP. Only an
+      external request wakes it, so that one genuinely needs an outside pinger.
+    * The **database** (Neon) suspends after ~5 minutes with no queries. That
+      does not need anything external -- it just needs a query.
+
+    Without this, an external ping would have to run every 4 minutes purely to
+    keep the database warm. With it, the external pinger only has to beat the
+    15-minute web-service timeout, which every free uptime monitor can do
+    comfortably. It also means a cold database can't be the thing that blows the
+    5-second webhook budget on the first event of a run.
+    """
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=180)
+            return  # stop was set
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await fetch_one("SELECT 1 AS ok")
+        except Exception:  # noqa: BLE001
+            log.warning("heartbeat query failed; database may be waking")
 
 
 app = FastAPI(title="LinkPlease", version="1.0.0", lifespan=lifespan)
