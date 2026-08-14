@@ -10,7 +10,6 @@ failing after the fact.
 
 - **Dashboard** — `/`
 - **Failure list** — [FAILURES.md](FAILURES.md) ← the interesting one
-- **How it was prompted** — [PROMPTS.md](PROMPTS.md)
 
 ---
 
