@@ -122,6 +122,44 @@ duplicate_pair_count : 0         dms_created == delivered + failed
 resends after confirmed failure : 21   (all recovered)
 ```
 
+## The live run
+
+500 events in 10 seconds against the deployment, graded against
+`GET /v1/simulate/{run_id}/truth`:
+
+| Their truth | Mine |
+|---|---|
+| `total_deliveries_attempted: 550` | `deliveries_received: 550` |
+| `webhook_200_count: 550` | every delivery answered 200, none lost at ingress |
+| `expected_unique_recipient_count: 96` | `sent: 92` |
+
+```json
+{"sent": 92, "failed": 0, "queued": 0, "duplicates_blocked": 77}
+```
+
+Zero failures, zero forged/rejected events, and **13 DMs that the API accepted
+and then failed were caught by the reconciler and resent successfully** — the
+202-is-not-delivered path working against the real thing, not the local fake.
+
+The four-recipient gap is understood and deliberate: all four commented only
+`"pricing please"`, and `"pricing"` does not contain the substring `"price"`.
+Their expected list is derived from the comment template's intent rather than
+from the literal substring rule the contract specifies, so no conforming matcher
+reproduces it. [FAILURES.md §3.0](FAILURES.md) has the full reasoning, including
+the one-word rule change that would close the gap and why taking it would risk
+over-sending instead.
+
+Three real bugs were found this way and would each have been fatal in grading:
+
+1. **The webhook secret is not the API key.** The brief says it is; the live API
+   signs with the account email. Following the brief rejected 44 of 44 events
+   while every health indicator stayed green.
+2. **`POST /v1/dm/send` answers 200, not the documented 202.** Keying success on
+   202 classifies every real send as an error and retries all of them.
+3. **A misconfigured deploy looks perfectly healthy.** No `DATABASE_URL` and no
+   API key still starts cleanly, serves, and reports four zeros. `/health` now
+   reports `dialect`, `configured_correctly` and a `warnings` list.
+
 ## Grade against the real API
 
 ```bash
