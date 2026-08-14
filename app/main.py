@@ -348,6 +348,29 @@ async def admin_sigdebug(x_admin_token: str = Header(default="")):
     return {"count": len(_signature_failures), "failures": list(_signature_failures)}
 
 
+@app.get("/admin/dump")
+async def admin_dump(x_admin_token: str = Header(default="")):
+    """Recipients we queued, and every comment we saw.
+
+    Exists to diff our matching against the graders' `expected_unique_recipients`
+    list. Knowing *that* the counts differ is useless; knowing *which* users are
+    missing, and what their comment text was, is what identifies a keyword the
+    rules do not cover.
+    """
+    if not settings.admin_token or x_admin_token != settings.admin_token:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    recipients = await fetch_all("SELECT DISTINCT user_id FROM dm_tasks ORDER BY user_id")
+    comments = await fetch_all(
+        "SELECT comment_id, user_id, text, deleted FROM comments ORDER BY first_seen_at"
+    )
+    return {
+        "task_recipients": [r["user_id"] for r in recipients],
+        "task_recipient_count": len(recipients),
+        "comments": [dict(c) for c in comments],
+    }
+
+
 @app.post("/admin/reset")
 async def admin_reset(x_admin_token: str = Header(default="")):
     """Clear all state. Used between self-grading simulation runs.
